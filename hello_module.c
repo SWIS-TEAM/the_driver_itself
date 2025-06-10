@@ -13,11 +13,12 @@
 #include <linux/seq_file.h>
 #include <linux/uaccess.h>
 #include <linux/string.h>
+#include <linux/workqueue.h>
 
 #define LOG_TAG           "zasoby_usb"
 #define INTERVAL_SECONDS  1
-#define USB_VENDOR_ID     0x303A    /* PODMIENIĆ na VID */
-#define USB_PRODUCT_ID    0x4001    /* PODMIENIĆ na PID */
+#define USB_VENDOR_ID     0x303A    /* PODMIEŃ na VID */
+#define USB_PRODUCT_ID    0x4001    /* PODMIEŃ na PID */
 #define PROCFS_NAME       "mydriver"
 
 static struct proc_dir_entry *proc_entry;
@@ -25,6 +26,17 @@ static bool use_gib = false;  /* domyślnie MiB */
 
 static struct timer_list zasoby_timer;
 static u64 last_user, last_idle, last_system;
+
+/* Workqueue definitions */
+static struct workqueue_struct *zasoby_wq;
+static DECLARE_WORK(zasoby_work, zasoby_work_fn);
+
+/* Forward declarations */
+static void zasoby_callback(struct timer_list *t);
+static void zasoby_work_fn(struct work_struct *work);
+static int  zasoby_probe(struct usb_interface *intf,
+                        const struct usb_device_id *id);
+static void zasoby_disconnect(struct usb_interface *intf);
 
 /* --- procfs show / write --- */
 static int proc_show(struct seq_file *m, void *v)
@@ -83,28 +95,21 @@ struct zasoby_usb {
 };
 static struct zasoby_usb *g_zasoby_dev;
 
-/* forward declarations */
-static void zasoby_callback(struct timer_list *t);
-static int  zasoby_probe(struct usb_interface *intf,
-                         const struct usb_device_id *id);
-static void zasoby_disconnect(struct usb_interface *intf);
-
-/* one and only usb_driver */
-static struct usb_driver zasoby_usb_driver = {
-    .name       = "zasoby_usb",
-    .probe      = zasoby_probe,
-    .disconnect = zasoby_disconnect,
-    .id_table   = zasoby_id_table,
-};
-
-/* timer callback: CPU/RAM + USB BULK OUT/IN */
+/* timer callback: just re-arm timer and queue work */
 static void zasoby_callback(struct timer_list *t)
+{
+    mod_timer(&zasoby_timer, jiffies + HZ * INTERVAL_SECONDS);
+    queue_work(zasoby_wq, &zasoby_work);
+}
+
+/* workqueue handler: CPU/RAM + USB BULK OUT/IN */
+static void zasoby_work_fn(struct work_struct *work)
 {
     struct sysinfo info;
     u64 tu = 0, ti = 0, ts = 0;
     u64 du, di, ds, dt;
     unsigned int pu = 0, ps = 0, pi = 0;
-    int cpu, online, possible;
+    int cpu;
     char msg[128];
     int len, actual, ret;
 
@@ -128,8 +133,6 @@ static void zasoby_callback(struct timer_list *t)
 
     /* Memory info */
     si_meminfo(&info);
-    online   = num_online_cpus();
-    possible = num_possible_cpus();
 
     /* prepare message (toggle between two commands) */
     {
@@ -142,7 +145,7 @@ static void zasoby_callback(struct timer_list *t)
         memcpy(msg, to_send, len);
     }
 
-    /* send via bulk out */
+    /* send via bulk out/in */
     if (g_zasoby_dev) {
         mutex_lock(&g_zasoby_dev->lock);
         ret = usb_bulk_msg(g_zasoby_dev->udev,
@@ -153,7 +156,6 @@ static void zasoby_callback(struct timer_list *t)
             dev_err(&g_zasoby_dev->udev->dev,
                 "bulk-out error %d\n", ret);
 
-        /* receive via bulk in */
         {
             char resp[128];
             int rlen;
@@ -163,7 +165,7 @@ static void zasoby_callback(struct timer_list *t)
                 resp, sizeof(resp)-1, &rlen, 1000);
             if (!ret) {
                 resp[rlen] = '\0';
-                printk(KERN_INFO LOG_TAG ": reply: %s\n", resp);
+                pr_info(LOG_TAG ": reply: %s\n", resp);
             } else {
                 dev_err(&g_zasoby_dev->udev->dev,
                     "bulk-in error %d\n", ret);
@@ -171,8 +173,6 @@ static void zasoby_callback(struct timer_list *t)
         }
         mutex_unlock(&g_zasoby_dev->lock);
     }
-
-    mod_timer(&zasoby_timer, jiffies + HZ * INTERVAL_SECONDS);
 }
 
 /* USB probe/disconnect */
@@ -193,19 +193,25 @@ static int zasoby_probe(struct usb_interface *intf,
     mutex_init(&g_zasoby_dev->lock);
     g_zasoby_dev->udev = usb_get_dev(interface_to_usbdev(intf));
 
-    /* find bulk endpoints */
     for (i = 0; i < alt->desc.bNumEndpoints; ++i) {
         ep = &alt->endpoint[i].desc;
-        if (usb_endpoint_is_bulk_out(ep)) {
+        if (usb_endpoint_is_bulk_out(ep))
             g_zasoby_dev->bulk_out_ep = ep->bEndpointAddress;
-        } else if (usb_endpoint_is_bulk_in(ep)) {
+        else if (usb_endpoint_is_bulk_in(ep))
             g_zasoby_dev->bulk_in_ep = ep->bEndpointAddress;
-        }
     }
     if (!g_zasoby_dev->bulk_out_ep || !g_zasoby_dev->bulk_in_ep) {
         dev_err(&intf->dev, "brak BULK OUT/IN\n");
         goto error_probe;
     }
+
+    /* create workqueue */
+    zasoby_wq = create_singlethread_workqueue("zasoby_wq");
+    if (!zasoby_wq) {
+        dev_err(&intf->dev, "failed to create workqueue\n");
+        goto error_probe;
+    }
+    INIT_WORK(&zasoby_work, zasoby_work_fn);
 
     /* setup timer */
     timer_setup(&zasoby_timer, zasoby_callback, 0);
@@ -228,6 +234,8 @@ static void zasoby_disconnect(struct usb_interface *intf)
         return;
 
     del_timer_sync(&zasoby_timer);
+    flush_workqueue(zasoby_wq);
+    destroy_workqueue(zasoby_wq);
     usb_put_dev(g_zasoby_dev->udev);
     kfree(g_zasoby_dev);
     g_zasoby_dev = NULL;
@@ -269,4 +277,4 @@ module_exit(zasoby_exit);
 MODULE_LICENSE("GPL");
 MODULE_AUTHOR("student_debil");
 MODULE_DESCRIPTION(
-    "Moduł CPU/RAM co 1s + USB BULK OUT/IN + procfs MiB/GiB sel; timer w probe");
+    "Moduł CPU/RAM co 1s + USB BULK OUT/IN + procfs MiB/GiB sel; workqueue zamiast timer callback");
