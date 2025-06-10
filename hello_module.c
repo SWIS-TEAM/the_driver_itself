@@ -160,7 +160,7 @@ static void zasoby_work_fn(struct work_struct *work)
     }
 
     /* build command with stats */
-    snprintf(cmd, sizeof(cmd), "CMD:%s", stats);
+    snprintf(cmd, sizeof(cmd), "%s", stats);
 
     /* wait for buffer semaphore */
     if (down_interruptible(&dev->limit_sem))
