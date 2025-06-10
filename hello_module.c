@@ -155,8 +155,8 @@ static void zasoby_work_fn(struct work_struct *work)
         unsigned long total = use_gib ? (total_mib >> 10) : total_mib;
         unsigned long free  = use_gib ? (free_mib  >> 10) : free_mib;
         const char *unit = use_gib ? "GiB" : "MiB";
-        snprintf(stats, sizeof(stats), "User: %u;System: %u;Idle: %u;RAM USED:%lu%s;RAM FREEE:%lu%s",
-                 pu, ps, pi, total, unit, free, unit);
+        snprintf(stats, sizeof(stats), "User: %u; System: %u; Idle: %u; RAM_USED: %lu%s; OUT_OF: %lu%s",
+                 pu, ps, pi, total-free, unit, total, unit);
     }
 
     /* build command with stats */
