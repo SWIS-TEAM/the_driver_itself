@@ -23,8 +23,11 @@
 #define PROCFS_NAME       "mydriver"
 #define BULK_IN_SIZE      512
 
-static struct proc_dir_entry *proc_entry;
+static struct proc_dir_entry *proc_dir;
+static struct proc_dir_entry *proc_entry_unit;
+static struct proc_dir_entry *proc_entry_stats;
 static bool use_gib = false;
+static char last_stats[256];
 
 static struct timer_list phy_resource_mgr_timer;
 static struct workqueue_struct *phy_resource_mgr_wq;
@@ -40,7 +43,7 @@ struct phy_resource_mgr {
 };
 static struct phy_resource_mgr *g_phy_resource_mgr_dev;
 
-/* procfs handlers */
+/* procfs: unit file */
 static int proc_show(struct seq_file *m, void *v)
 {
     seq_printf(m, "%s\n", use_gib ? "GiB" : "MiB");
@@ -71,12 +74,31 @@ static ssize_t proc_write(struct file *file,
     return count;
 }
 
-static const struct proc_ops proc_file_ops = {
+static const struct proc_ops proc_unit_ops = {
     .proc_open    = proc_open,
     .proc_read    = seq_read,
     .proc_lseek   = seq_lseek,
     .proc_release = single_release,
     .proc_write   = proc_write,
+};
+
+/* procfs: stats file */
+static int proc_stats_show(struct seq_file *m, void *v)
+{
+    seq_printf(m, "%s\n", last_stats);
+    return 0;
+}
+
+static int proc_stats_open(struct inode *inode, struct file *file)
+{
+    return single_open(file, proc_stats_show, NULL);
+}
+
+static const struct proc_ops proc_stats_ops = {
+    .proc_open    = proc_stats_open,
+    .proc_read    = seq_read,
+    .proc_lseek   = seq_lseek,
+    .proc_release = single_release,
 };
 
 /* forward declarations */
@@ -131,7 +153,6 @@ static void phy_resource_mgr_work_fn(struct work_struct *work)
     void *buf;
     dma_addr_t dma;
 
-    /* CPU usage calc */
     for_each_online_cpu(cpu) {
         struct kernel_cpustat k = kcpustat_cpu(cpu);
         tu += k.cpustat[CPUTIME_USER];
@@ -147,7 +168,6 @@ static void phy_resource_mgr_work_fn(struct work_struct *work)
         pi = 100 - pu - ps;
     }
 
-    /* Memory info */
     si_meminfo(&info);
     {
         unsigned long total_mib = (info.totalram << (PAGE_SHIFT - 10)) / 1024;
@@ -156,24 +176,22 @@ static void phy_resource_mgr_work_fn(struct work_struct *work)
         unsigned long free  = use_gib ? (free_mib  >> 10) : free_mib;
         const char *unit = use_gib ? "GiB" : "MiB";
         snprintf(stats, sizeof(stats), "User: %u%%; System: %u%%; Idle: %u%%; RAM_USED: %lu%s; OUT_OF: %lu%s",
-                 pu, ps, pi, total-free, unit, total, unit);
+                 pu, ps, pi, total - free, unit, total, unit);
+        strncpy(last_stats, stats, sizeof(last_stats) - 1);
+        last_stats[sizeof(last_stats) - 1] = '\0';
     }
 
-    /* build command with stats */
     snprintf(cmd, sizeof(cmd), "%s", stats);
 
-    /* wait for buffer semaphore */
     if (down_interruptible(&dev->limit_sem))
         return;
 
-    /* allocate URB and coherent buffer */
     urb = usb_alloc_urb(0, GFP_KERNEL);
     if (!urb) { up(&dev->limit_sem); return; }
     buf = usb_alloc_coherent(dev->udev, strlen(cmd), GFP_KERNEL, &dma);
     if (!buf) { usb_free_urb(urb); up(&dev->limit_sem); return; }
     memcpy(buf, cmd, strlen(cmd));
 
-    /* fill and submit URB */
     usb_fill_bulk_urb(urb,
                       dev->udev,
                       usb_sndbulkpipe(dev->udev, dev->bulk_out_ep),
@@ -192,17 +210,14 @@ static void phy_resource_mgr_work_fn(struct work_struct *work)
         up(&dev->limit_sem);
     }
 
-    /* re-arm timer */
     mod_timer(&phy_resource_mgr_timer, jiffies + HZ * INTERVAL_SECONDS);
 }
 
-/* timer callback: queue work */
 static void phy_resource_mgr_callback(struct timer_list *t)
 {
     queue_work(phy_resource_mgr_wq, &phy_resource_mgr_work);
 }
 
-/* USB probe */
 static int phy_resource_mgr_probe(struct usb_interface *intf,
                         const struct usb_device_id *id)
 {
@@ -246,7 +261,6 @@ fail:
     return -ENODEV;
 }
 
-/* USB disconnect */
 static void phy_resource_mgr_disconnect(struct usb_interface *intf)
 {
     struct phy_resource_mgr *dev = usb_get_intfdata(intf);
@@ -259,17 +273,24 @@ static void phy_resource_mgr_disconnect(struct usb_interface *intf)
     pr_info(LOG_TAG ": disconnected\n");
 }
 
-/* module init/exit */
 static int __init phy_resource_mgr_init(void)
 {
     int ret;
-    proc_entry = proc_create(PROCFS_NAME, 0666, NULL, &proc_file_ops);
-    if (!proc_entry)
+
+    proc_dir = proc_mkdir(PROCFS_NAME, NULL);
+    if (!proc_dir)
         return -ENOMEM;
+
+    proc_entry_unit = proc_create("unit", 0666, proc_dir, &proc_unit_ops);
+    proc_entry_stats = proc_create("stats", 0444, proc_dir, &proc_stats_ops);
+    if (!proc_entry_unit || !proc_entry_stats) {
+        proc_remove(proc_dir);
+        return -ENOMEM;
+    }
 
     ret = usb_register(&phy_resource_mgr_driver);
     if (ret) {
-        proc_remove(proc_entry);
+        proc_remove(proc_dir);
         return ret;
     }
     pr_info(LOG_TAG ": module loaded\n");
@@ -279,7 +300,7 @@ static int __init phy_resource_mgr_init(void)
 static void __exit phy_resource_mgr_exit(void)
 {
     usb_deregister(&phy_resource_mgr_driver);
-    proc_remove(proc_entry);
+    proc_remove(proc_dir);
     pr_info(LOG_TAG ": module unloaded\n");
 }
 
