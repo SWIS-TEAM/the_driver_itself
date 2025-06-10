@@ -1,4 +1,4 @@
-obj-m += hello_module.o
+obj-m += phy_resource_mgr.o
 
 all:
 	make -C /lib/modules/$(shell uname -r)/build M=$(PWD) modules
