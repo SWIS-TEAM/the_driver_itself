@@ -16,29 +16,29 @@
 #include <linux/string.h>
 #include <linux/workqueue.h>
 
-#define LOG_TAG           "zasoby_usb"
+#define LOG_TAG           "phy_resource_mgr"
 #define INTERVAL_SECONDS  1
-#define USB_VENDOR_ID     0x303A    /* PODMIEŃ na VID */
-#define USB_PRODUCT_ID    0x4001    /* PODMIEŃ na PID */
+#define USB_VENDOR_ID     0x303A
+#define USB_PRODUCT_ID    0x4001
 #define PROCFS_NAME       "mydriver"
 #define BULK_IN_SIZE      512
 
 static struct proc_dir_entry *proc_entry;
 static bool use_gib = false;
 
-static struct timer_list zasoby_timer;
-static struct workqueue_struct *zasoby_wq;
-static struct work_struct zasoby_work;
+static struct timer_list phy_resource_mgr_timer;
+static struct workqueue_struct *phy_resource_mgr_wq;
+static struct work_struct phy_resource_mgr_work;
 static u64 last_user, last_idle, last_system;
 
-struct zasoby_usb {
+struct phy_resource_mgr {
     struct usb_device    *udev;
     struct usb_interface *interface;
     __u8                  bulk_out_ep;
     __u8                  bulk_in_ep;
     struct semaphore      limit_sem;
 };
-static struct zasoby_usb *g_zasoby_dev;
+static struct phy_resource_mgr *g_phy_resource_mgr_dev;
 
 /* procfs handlers */
 static int proc_show(struct seq_file *m, void *v)
@@ -80,31 +80,31 @@ static const struct proc_ops proc_file_ops = {
 };
 
 /* forward declarations */
-static void zasoby_work_fn(struct work_struct *work);
-static void zasoby_callback(struct timer_list *t);
-static int zasoby_probe(struct usb_interface *intf,
+static void phy_resource_mgr_work_fn(struct work_struct *work);
+static void phy_resource_mgr_callback(struct timer_list *t);
+static int phy_resource_mgr_probe(struct usb_interface *intf,
                         const struct usb_device_id *id);
-static void zasoby_disconnect(struct usb_interface *intf);
+static void phy_resource_mgr_disconnect(struct usb_interface *intf);
 static void write_bulk_callback(struct urb *urb);
 
 /* USB IDs */
-static const struct usb_device_id zasoby_id_table[] = {
+static const struct usb_device_id phy_resource_mgr_id_table[] = {
     { USB_DEVICE(USB_VENDOR_ID, USB_PRODUCT_ID) },
     { }
 };
-MODULE_DEVICE_TABLE(usb, zasoby_id_table);
+MODULE_DEVICE_TABLE(usb, phy_resource_mgr_id_table);
 
-static struct usb_driver zasoby_usb_driver = {
-    .name       = "zasoby_usb",
-    .probe      = zasoby_probe,
-    .disconnect = zasoby_disconnect,
-    .id_table   = zasoby_id_table,
+static struct usb_driver phy_resource_mgr_driver = {
+    .name       = "phy_resource_mgr",
+    .probe      = phy_resource_mgr_probe,
+    .disconnect = phy_resource_mgr_disconnect,
+    .id_table   = phy_resource_mgr_id_table,
 };
 
 /* write completion callback */
 static void write_bulk_callback(struct urb *urb)
 {
-    struct zasoby_usb *dev = urb->context;
+    struct phy_resource_mgr *dev = urb->context;
     if (urb->status) {
         dev_err(&dev->interface->dev,
                 "%s: status %d\n", __func__, urb->status);
@@ -118,7 +118,7 @@ static void write_bulk_callback(struct urb *urb)
 }
 
 /* workqueue handler: gather stats and send via USB */
-static void zasoby_work_fn(struct work_struct *work)
+static void phy_resource_mgr_work_fn(struct work_struct *work)
 {
     struct sysinfo info;
     u64 tu = 0, ti = 0, ts = 0;
@@ -126,7 +126,7 @@ static void zasoby_work_fn(struct work_struct *work)
     unsigned int pu = 0, ps = 0, pi = 0;
     int cpu, ret;
     char stats[128], cmd[128];
-    struct zasoby_usb *dev = g_zasoby_dev;
+    struct phy_resource_mgr *dev = g_phy_resource_mgr_dev;
     struct urb *urb;
     void *buf;
     dma_addr_t dma;
@@ -155,7 +155,7 @@ static void zasoby_work_fn(struct work_struct *work)
         unsigned long total = use_gib ? (total_mib >> 10) : total_mib;
         unsigned long free  = use_gib ? (free_mib  >> 10) : free_mib;
         const char *unit = use_gib ? "GiB" : "MiB";
-        snprintf(stats, sizeof(stats), "User: %u; System: %u; Idle: %u; RAM_USED: %lu%s; OUT_OF: %lu%s",
+        snprintf(stats, sizeof(stats), "User: %u%%; System: %u%%; Idle: %u%%; RAM_USED: %lu%s; OUT_OF: %lu%s",
                  pu, ps, pi, total-free, unit, total, unit);
     }
 
@@ -193,22 +193,22 @@ static void zasoby_work_fn(struct work_struct *work)
     }
 
     /* re-arm timer */
-    mod_timer(&zasoby_timer, jiffies + HZ * INTERVAL_SECONDS);
+    mod_timer(&phy_resource_mgr_timer, jiffies + HZ * INTERVAL_SECONDS);
 }
 
 /* timer callback: queue work */
-static void zasoby_callback(struct timer_list *t)
+static void phy_resource_mgr_callback(struct timer_list *t)
 {
-    queue_work(zasoby_wq, &zasoby_work);
+    queue_work(phy_resource_mgr_wq, &phy_resource_mgr_work);
 }
 
 /* USB probe */
-static int zasoby_probe(struct usb_interface *intf,
+static int phy_resource_mgr_probe(struct usb_interface *intf,
                         const struct usb_device_id *id)
 {
     struct usb_host_interface *alt = intf->cur_altsetting;
     struct usb_endpoint_descriptor *ep;
-    struct zasoby_usb *dev;
+    struct phy_resource_mgr *dev;
     int i;
 
     dev = kzalloc(sizeof(*dev), GFP_KERNEL);
@@ -227,15 +227,15 @@ static int zasoby_probe(struct usb_interface *intf,
         goto fail;
 
     usb_set_intfdata(intf, dev);
-    g_zasoby_dev = dev;
+    g_phy_resource_mgr_dev = dev;
 
-    zasoby_wq = create_singlethread_workqueue("zasoby_wq");
-    if (!zasoby_wq)
+    phy_resource_mgr_wq = create_singlethread_workqueue("phy_resource_mgr_wq");
+    if (!phy_resource_mgr_wq)
         goto fail;
-    INIT_WORK(&zasoby_work, zasoby_work_fn);
+    INIT_WORK(&phy_resource_mgr_work, phy_resource_mgr_work_fn);
 
-    timer_setup(&zasoby_timer, zasoby_callback, 0);
-    mod_timer(&zasoby_timer, jiffies + HZ * INTERVAL_SECONDS);
+    timer_setup(&phy_resource_mgr_timer, phy_resource_mgr_callback, 0);
+    mod_timer(&phy_resource_mgr_timer, jiffies + HZ * INTERVAL_SECONDS);
 
     pr_info(LOG_TAG ": connected\n");
     return 0;
@@ -247,27 +247,27 @@ fail:
 }
 
 /* USB disconnect */
-static void zasoby_disconnect(struct usb_interface *intf)
+static void phy_resource_mgr_disconnect(struct usb_interface *intf)
 {
-    struct zasoby_usb *dev = usb_get_intfdata(intf);
+    struct phy_resource_mgr *dev = usb_get_intfdata(intf);
 
-    del_timer_sync(&zasoby_timer);
-    cancel_work_sync(&zasoby_work);
-    destroy_workqueue(zasoby_wq);
+    del_timer_sync(&phy_resource_mgr_timer);
+    cancel_work_sync(&phy_resource_mgr_work);
+    destroy_workqueue(phy_resource_mgr_wq);
     usb_put_dev(dev->udev);
     kfree(dev);
     pr_info(LOG_TAG ": disconnected\n");
 }
 
 /* module init/exit */
-static int __init zasoby_init(void)
+static int __init phy_resource_mgr_init(void)
 {
     int ret;
     proc_entry = proc_create(PROCFS_NAME, 0666, NULL, &proc_file_ops);
     if (!proc_entry)
         return -ENOMEM;
 
-    ret = usb_register(&zasoby_usb_driver);
+    ret = usb_register(&phy_resource_mgr_driver);
     if (ret) {
         proc_remove(proc_entry);
         return ret;
@@ -276,18 +276,18 @@ static int __init zasoby_init(void)
     return 0;
 }
 
-static void __exit zasoby_exit(void)
+static void __exit phy_resource_mgr_exit(void)
 {
-    usb_deregister(&zasoby_usb_driver);
+    usb_deregister(&phy_resource_mgr_driver);
     proc_remove(proc_entry);
     pr_info(LOG_TAG ": module unloaded\n");
 }
 
-module_init(zasoby_init);
-module_exit(zasoby_exit);
+module_init(phy_resource_mgr_init);
+module_exit(phy_resource_mgr_exit);
 
 MODULE_LICENSE("GPL");
-MODULE_AUTHOR("student_debil");
+MODULE_AUTHOR("Piotrki: Baprawski i Polnau");
 MODULE_DESCRIPTION(
-    "Moduł CPU/RAM co 1s + USB BULK OUT/IN cez URB + dynamic stats cmd"
+    "Module CPU/RAM every 1s + USB BULK OUT/IN URB dynamic stats"
 );
