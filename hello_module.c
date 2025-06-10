@@ -125,7 +125,7 @@ static void zasoby_work_fn(struct work_struct *work)
     u64 du, di, ds, dt;
     unsigned int pu = 0, ps = 0, pi = 0;
     int cpu, ret;
-    char stats[64], cmd[80];
+    char stats[128], cmd[128];
     struct zasoby_usb *dev = g_zasoby_dev;
     struct urb *urb;
     void *buf;
