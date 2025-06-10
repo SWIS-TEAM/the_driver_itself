@@ -9,6 +9,7 @@
 #include <linux/usb.h>
 #include <linux/slab.h>
 #include <linux/mutex.h>
+#include <linux/semaphore.h>
 #include <linux/proc_fs.h>
 #include <linux/seq_file.h>
 #include <linux/uaccess.h>
@@ -23,293 +24,232 @@
 #define BULK_IN_SIZE      512
 
 static struct proc_dir_entry *proc_entry;
-static bool use_gib = false;  /* domyślnie MiB */
+static bool use_gib = false;
 
 static struct timer_list zasoby_timer;
 static struct workqueue_struct *zasoby_wq;
 static struct work_struct zasoby_work;
 static u64 last_user, last_idle, last_system;
 
-/* USB device state */
 struct zasoby_usb {
-    struct usb_device       *udev;
-    struct usb_interface    *interface;
-    __u8                     bulk_out_ep;
-    __u8                     bulk_in_ep;
-    struct urb              *urb_out;
-    struct urb              *urb_in;
-    unsigned char           *buf_out;
-    unsigned char           *buf_in;
-    size_t                   buf_in_size;
-    struct mutex             lock;
+    struct usb_device    *udev;
+    struct usb_interface *interface;
+    __u8                  bulk_out_ep;
+    __u8                  bulk_in_ep;
+    struct semaphore      limit_sem;
+    unsigned char        *buf_in;
+    size_t                buf_in_size;
 };
 static struct zasoby_usb *g_zasoby_dev;
 
-/* procfs handlers */
+/* procfs */
 static int proc_show(struct seq_file *m, void *v)
 {
     seq_printf(m, "%s\n", use_gib ? "GiB" : "MiB");
     return 0;
 }
-
 static int proc_open(struct inode *inode, struct file *file)
-{
-    return single_open(file, proc_show, NULL);
-}
-
-static ssize_t proc_write(struct file *file,
-                          const char __user *buf,
+{ return single_open(file, proc_show, NULL); }
+static ssize_t proc_write(struct file *file, const char __user *buf,
                           size_t count, loff_t *pos)
 {
     char kbuf[8];
-    if (count >= sizeof(kbuf))
-        return -EINVAL;
-    if (copy_from_user(kbuf, buf, count))
-        return -EFAULT;
+    if (count >= sizeof(kbuf)) return -EINVAL;
+    if (copy_from_user(kbuf, buf, count)) return -EFAULT;
     kbuf[count] = '\0';
     if (!strncmp(kbuf, "MiB", 3))
         use_gib = false;
     else if (!strncmp(kbuf, "GiB", 3))
         use_gib = true;
-    else
-        return -EINVAL;
+    else return -EINVAL;
     return count;
 }
-
 static const struct proc_ops proc_file_ops = {
-    .proc_open    = proc_open,
-    .proc_read    = seq_read,
-    .proc_lseek   = seq_lseek,
+    .proc_open = proc_open,
+    .proc_read = seq_read,
+    .proc_lseek = seq_lseek,
     .proc_release = single_release,
-    .proc_write   = proc_write,
+    .proc_write = proc_write
 };
 
-/* forward declarations */
+/* forward */
 static void zasoby_work_fn(struct work_struct *work);
 static void zasoby_callback(struct timer_list *t);
 static int zasoby_probe(struct usb_interface *intf,
                         const struct usb_device_id *id);
 static void zasoby_disconnect(struct usb_interface *intf);
-static void urb_in_complete(struct urb *urb);
+static void write_bulk_callback(struct urb *urb);
 
-/* USB id table and driver */
+/* USB IDs */
 static const struct usb_device_id zasoby_id_table[] = {
-    { USB_DEVICE(USB_VENDOR_ID, USB_PRODUCT_ID) },
-    { }
+    { USB_DEVICE(USB_VENDOR_ID, USB_PRODUCT_ID)}, {}
 };
 MODULE_DEVICE_TABLE(usb, zasoby_id_table);
-
 static struct usb_driver zasoby_usb_driver = {
-    .name       = "zasoby_usb",
-    .probe      = zasoby_probe,
+    .name = "zasoby_usb",
+    .probe = zasoby_probe,
     .disconnect = zasoby_disconnect,
-    .id_table   = zasoby_id_table,
+    .id_table = zasoby_id_table
 };
 
-/* URB IN completion: print response */
-static void urb_in_complete(struct urb *urb)
+/* write completion */
+static void write_bulk_callback(struct urb *urb)
 {
     struct zasoby_usb *dev = urb->context;
-    if (urb->status == 0) {
-        dev->buf_in[urb->actual_length] = '\0';
-        pr_info(LOG_TAG ": reply: %s\n", dev->buf_in);
-    } else {
+    unsigned long flags;
+
+    if (urb->status) {
         dev_err(&dev->interface->dev,
-                "bulk-in error %d\n", urb->status);
+                "%s: status %d\n", __func__, urb->status);
     }
+    usb_free_coherent(urb->dev,
+                      urb->transfer_buffer_length,
+                      urb->transfer_buffer,
+                      urb->transfer_dma);
+    up(&dev->limit_sem);
+    usb_free_urb(urb);
 }
 
-/* workqueue handler: CPU/RAM + USB via URBs */
+/* workqueue: prepare and send write, then schedule read */
 static void zasoby_work_fn(struct work_struct *work)
 {
     struct sysinfo info;
-    u64 tu = 0, ti = 0, ts = 0;
-    u64 du, di, ds, dt;
-    unsigned int pu = 0, ps = 0, pi = 0;
-    int cpu;
+    u64 tu=0,ti=0,ts=0;
+    u64 du,di,ds,dt;
+    unsigned int pu=0,ps=0,pi=0;
+    int cpu, ret;
     size_t len;
-    const char *cmd1 = "CPU:30;RAM:20;DISK:10";
-    const char *cmd2 = "CPU:40;RAM:50;DISK:30";
+    const char *cmd1="CPU:30;RAM:20;DISK:10";
+    const char *cmd2="CPU:40;RAM:50;DISK:30";
     const char *to_send;
     struct zasoby_usb *dev = g_zasoby_dev;
-    int ret;
+    struct urb *urb;
+    void *buf;
+    dma_addr_t dma;
 
-    /* CPU usage calc */
+    /* CPU usage */
     for_each_online_cpu(cpu) {
         struct kernel_cpustat k = kcpustat_cpu(cpu);
-        tu += k.cpustat[CPUTIME_USER];
-        ti += k.cpustat[CPUTIME_IDLE];
-        ts += k.cpustat[CPUTIME_SYSTEM];
+        tu+=k.cpustat[CPUTIME_USER]; ti+=k.cpustat[CPUTIME_IDLE]; ts+=k.cpustat[CPUTIME_SYSTEM];
     }
-    du = tu - last_user;  di = ti - last_idle;  ds = ts - last_system;
-    dt = du + di + ds;
-    last_user   = tu;
-    last_idle   = ti;
-    last_system = ts;
-    if (dt) {
-        pu = (100ULL * du) / dt;
-        ps = (100ULL * ds) / dt;
-        pi = 100 - pu - ps;
-    }
-
-    /* Memory info */
+    du=tu-last_user; di=ti-last_idle; ds=ts-last_system;
+    dt=du+di+ds;
+    last_user=tu; last_idle=ti; last_system=ts;
+    if (dt) { pu=(100*du)/dt; ps=(100*ds)/dt; pi=100-pu-ps; }
     si_meminfo(&info);
 
-    /* toggle message */
-    static bool second = false;
-    to_send = second ? cmd2 : cmd1;
-    second = !second;
+    /* toggle */
+    static bool second=false;
+    to_send = second?cmd2:cmd1;
+    second=!second;
     len = strlen(to_send);
 
-    /* fill out URB buffer */
-    mutex_lock(&dev->lock);
-    memcpy(dev->buf_out, to_send, len);
-    usb_fill_bulk_urb(dev->urb_out,
+    /* block until buffer frees */
+    if (down_interruptible(&dev->limit_sem)) return;
+
+    /* alloc URB and buffer */
+    urb = usb_alloc_urb(0, GFP_KERNEL);
+    if (!urb) { up(&dev->limit_sem); return; }
+    buf = usb_alloc_coherent(dev->udev, len, GFP_KERNEL, &dma);
+    if (!buf) { usb_free_urb(urb); up(&dev->limit_sem); return; }
+    memcpy(buf, to_send, len);
+
+    /* fill and submit */
+    usb_fill_bulk_urb(urb,
                       dev->udev,
                       usb_sndbulkpipe(dev->udev, dev->bulk_out_ep),
-                      dev->buf_out,
+                      buf,
                       len,
-                      NULL, /* no completion for OUT */
+                      write_bulk_callback,
                       dev);
-    ret = usb_submit_urb(dev->urb_out, GFP_KERNEL);
-    if (ret)
+    urb->transfer_dma = dma;
+    urb->transfer_flags |= URB_NO_TRANSFER_DMA_MAP;
+    ret = usb_submit_urb(urb, GFP_ATOMIC);
+    if (ret) {
         dev_err(&dev->interface->dev,
-                "bulk-out submit error %d\n", ret);
-
-    /* schedule IN URB */
-    usb_fill_bulk_urb(dev->urb_in,
-                      dev->udev,
-                      usb_rcvbulkpipe(dev->udev, dev->bulk_in_ep),
-                      dev->buf_in,
-                      dev->buf_in_size - 1,
-                      urb_in_complete,
-                      dev);
-    ret = usb_submit_urb(dev->urb_in, GFP_KERNEL);
-    if (ret)
-        dev_err(&dev->interface->dev,
-                "bulk-in submit error %d\n", ret);
-    mutex_unlock(&dev->lock);
+                "%s submit error %d\n", __func__, ret);
+        usb_free_coherent(dev->udev, len, buf, dma);
+        usb_free_urb(urb);
+        up(&dev->limit_sem);
+    }
 
     /* re-arm timer */
-    mod_timer(&zasoby_timer, jiffies + HZ * INTERVAL_SECONDS);
+    mod_timer(&zasoby_timer, jiffies+HZ*INTERVAL_SECONDS);
 }
 
-/* timer callback: queue work */
+/* timer */
 static void zasoby_callback(struct timer_list *t)
 {
     queue_work(zasoby_wq, &zasoby_work);
 }
 
-/* USB probe */
+/* probe */
 static int zasoby_probe(struct usb_interface *intf,
                         const struct usb_device_id *id)
 {
     struct usb_host_interface *alt = intf->cur_altsetting;
     struct usb_endpoint_descriptor *ep;
-    int i;
     struct zasoby_usb *dev;
+    int i;
 
     dev = kzalloc(sizeof(*dev), GFP_KERNEL);
-    if (!dev)
-        return -ENOMEM;
-    dev->interface = intf;
-    dev->udev = usb_get_dev(interface_to_usbdev(intf));
-    mutex_init(&dev->lock);
+    if (!dev) return -ENOMEM;
+    dev->interface=intf;
+    dev->udev=usb_get_dev(interface_to_usbdev(intf));
+    sema_init(&dev->limit_sem, 1);
 
-    /* find bulk endpoints */
-    for (i = 0; i < alt->desc.bNumEndpoints; ++i) {
-        ep = &alt->endpoint[i].desc;
-        if (usb_endpoint_is_bulk_out(ep))
-            dev->bulk_out_ep = ep->bEndpointAddress;
-        else if (usb_endpoint_is_bulk_in(ep))
-            dev->bulk_in_ep = ep->bEndpointAddress;
+    for (i=0;i<alt->desc.bNumEndpoints;i++){
+        ep=&alt->endpoint[i].desc;
+        if (usb_endpoint_is_bulk_out(ep)) dev->bulk_out_ep=ep->bEndpointAddress;
+        if (usb_endpoint_is_bulk_in(ep))  dev->bulk_in_ep =ep->bEndpointAddress;
     }
-    if (!dev->bulk_out_ep || !dev->bulk_in_ep) {
-        dev_err(&intf->dev, "brak BULK OUT/IN\n");
-        kfree(dev);
-        return -ENODEV;
-    }
+    if (!dev->bulk_out_ep||!dev->bulk_in_ep) goto fail;
 
-    /* allocate URBs and buffers */
-    dev->urb_out = usb_alloc_urb(0, GFP_KERNEL);
-    dev->urb_in  = usb_alloc_urb(0, GFP_KERNEL);
-    dev->buf_out = kmalloc(128, GFP_KERNEL);
-    dev->buf_in_size = BULK_IN_SIZE;
-    dev->buf_in = kmalloc(dev->buf_in_size, GFP_KERNEL);
-    if (!dev->urb_out || !dev->urb_in || !dev->buf_out || !dev->buf_in) {
-        dev_err(&intf->dev, "failed alloc urb/bufs\n");
-        goto error_alloc;
-    }
+    usb_set_intfdata(intf,dev);
+    g_zasoby_dev=dev;
 
-    usb_set_intfdata(intf, dev);
-    g_zasoby_dev = dev;
-
-    /* create workqueue and INIT_WORK */
-    zasoby_wq = create_singlethread_workqueue("zasoby_wq");
-    if (!zasoby_wq)
-        goto error_alloc;
+    zasoby_wq=create_singlethread_workqueue("zasoby_wq");
+    if (!zasoby_wq) goto fail;
     INIT_WORK(&zasoby_work, zasoby_work_fn);
 
-    /* setup timer */
-    timer_setup(&zasoby_timer, zasoby_callback, 0);
-    mod_timer(&zasoby_timer, jiffies + HZ * INTERVAL_SECONDS);
+    timer_setup(&zasoby_timer,zasoby_callback,0);
+    mod_timer(&zasoby_timer,jiffies+HZ*INTERVAL_SECONDS);
 
-    dev_info(&intf->dev, "zasoby_usb: connected\n");
+    pr_info(LOG_TAG": connected\n");
     return 0;
-
-error_alloc:
-    if (dev->urb_out) usb_free_urb(dev->urb_out);
-    if (dev->urb_in) usb_free_urb(dev->urb_in);
-    kfree(dev->buf_out);
-    kfree(dev->buf_in);
+fail:
     usb_put_dev(dev->udev);
     kfree(dev);
-    return -ENOMEM;
+    return -ENODEV;
 }
 
-/* USB disconnect */
 static void zasoby_disconnect(struct usb_interface *intf)
 {
     struct zasoby_usb *dev = usb_get_intfdata(intf);
-
     del_timer_sync(&zasoby_timer);
     cancel_work_sync(&zasoby_work);
     destroy_workqueue(zasoby_wq);
-
-    usb_kill_urb(dev->urb_out);
-    usb_kill_urb(dev->urb_in);
-    usb_free_urb(dev->urb_out);
-    usb_free_urb(dev->urb_in);
-    kfree(dev->buf_out);
-    kfree(dev->buf_in);
-
     usb_put_dev(dev->udev);
     kfree(dev);
-    pr_info(LOG_TAG ": disconnected\n");
+    pr_info(LOG_TAG": disconnected\n");
 }
 
-/* module init/exit */
+/* init/exit */
 static int __init zasoby_init(void)
 {
     int ret;
-    proc_entry = proc_create(PROCFS_NAME, 0666, NULL, &proc_file_ops);
-    if (!proc_entry)
-        return -ENOMEM;
-
-    ret = usb_register(&zasoby_usb_driver);
-    if (ret) {
-        proc_remove(proc_entry);
-        return ret;
-    }
-    pr_info(LOG_TAG ": module loaded\n");
+    proc_entry=proc_create(PROCFS_NAME,0666,NULL,&proc_file_ops);
+    if(!proc_entry) return -ENOMEM;
+    ret=usb_register(&zasoby_usb_driver);
+    if(ret){proc_remove(proc_entry);return ret;}
+    pr_info(LOG_TAG": module loaded\n");
     return 0;
 }
-
 static void __exit zasoby_exit(void)
 {
     usb_deregister(&zasoby_usb_driver);
     proc_remove(proc_entry);
-    pr_info(LOG_TAG ": module unloaded\n");
+    pr_info(LOG_TAG": module unloaded\n");
 }
 
 module_init(zasoby_init);
@@ -318,4 +258,4 @@ module_exit(zasoby_exit);
 MODULE_LICENSE("GPL");
 MODULE_AUTHOR("student_debil");
 MODULE_DESCRIPTION(
-    "Moduł CPU/RAM co 1s + USB BULK OUT/IN asynchronicznie przez URB + procfs");
+    "Moduł CPU/RAM co 1s + USB BULK OUT/IN cez URB z coherent buffers + procfs");
