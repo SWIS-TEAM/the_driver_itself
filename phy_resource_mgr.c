@@ -125,7 +125,7 @@ static void phy_resource_mgr_work_fn(struct work_struct *work)
     u64 du, di, ds, dt;
     unsigned int pu = 0, ps = 0, pi = 0;
     int cpu, ret;
-    char stats[128], cmd[128];
+    char stats[256], cmd[256];
     struct phy_resource_mgr *dev = g_phy_resource_mgr_dev;
     struct urb *urb;
     void *buf;
