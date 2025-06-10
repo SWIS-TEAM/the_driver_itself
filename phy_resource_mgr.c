@@ -8,7 +8,6 @@
 #include <linux/smp.h>
 #include <linux/usb.h>
 #include <linux/slab.h>
-#include <linux/mutex.h>
 #include <linux/semaphore.h>
 #include <linux/proc_fs.h>
 #include <linux/seq_file.h>
@@ -26,6 +25,7 @@
 static struct proc_dir_entry *proc_dir;
 static struct proc_dir_entry *proc_entry_unit;
 static struct proc_dir_entry *proc_entry_stats;
+
 static bool use_gib = false;
 static char last_stats[256];
 
@@ -169,22 +169,23 @@ static void phy_resource_mgr_work_fn(struct work_struct *work)
     }
 
     si_meminfo(&info);
-    {
-        unsigned long total_mib = (info.totalram << (PAGE_SHIFT - 10)) / 1024;
-        unsigned long free_mib  = (info.freeram  << (PAGE_SHIFT - 10)) / 1024;
-        unsigned long total = use_gib ? (total_mib >> 10) : total_mib;
-        unsigned long free  = use_gib ? (free_mib  >> 10) : free_mib;
-        const char *unit = use_gib ? "GiB" : "MiB";
-        snprintf(stats, sizeof(stats), "User: %u%%; System: %u%%; Idle: %u%%; RAM_USED: %lu%s; OUT_OF: %lu%s",
-                 pu, ps, pi, total - free, unit, total, unit);
-        strncpy(last_stats, stats, sizeof(last_stats) - 1);
-        last_stats[sizeof(last_stats) - 1] = '\0';
-    }
+    unsigned long total_mib = (info.totalram << (PAGE_SHIFT - 10)) / 1024;
+    unsigned long free_mib  = (info.freeram  << (PAGE_SHIFT - 10)) / 1024;
+    unsigned long total = use_gib ? (total_mib >> 10) : total_mib;
+    unsigned long free  = use_gib ? (free_mib  >> 10) : free_mib;
+    const char *unit = use_gib ? "GiB" : "MiB";
+    snprintf(stats, sizeof(stats), "User: %u%%; System: %u%%; Idle: %u%%; RAM_USED: %lu%s; OUT_OF: %lu%s",
+                pu, ps, pi, total - free, unit, total, unit);
+    strncpy(last_stats, stats, sizeof(last_stats) - 1);
+    last_stats[sizeof(last_stats) - 1] = '\0';
 
     snprintf(cmd, sizeof(cmd), "%s", stats);
 
     if (down_interruptible(&dev->limit_sem))
+    {
         return;
+    }
+
 
     urb = usb_alloc_urb(0, GFP_KERNEL);
     if (!urb) { up(&dev->limit_sem); return; }
@@ -308,7 +309,7 @@ module_init(phy_resource_mgr_init);
 module_exit(phy_resource_mgr_exit);
 
 MODULE_LICENSE("GPL");
-MODULE_AUTHOR("Piotrki: Baprawski i Polnau");
+MODULE_AUTHOR("Piotr Baprawski i Piotr Polnau");
 MODULE_DESCRIPTION(
-    "Module CPU/RAM every 1s + USB BULK OUT/IN URB dynamic stats"
+    "USB driver for a physical resource monitor device reporting CPU and memory usage every second."
 );
