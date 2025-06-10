@@ -20,6 +20,7 @@
 #define USB_VENDOR_ID     0x303A    /* PODMIEŃ na VID */
 #define USB_PRODUCT_ID    0x4001    /* PODMIEŃ na PID */
 #define PROCFS_NAME       "mydriver"
+#define BULK_IN_SIZE      512
 
 static struct proc_dir_entry *proc_entry;
 static bool use_gib = false;  /* domyślnie MiB */
@@ -31,10 +32,16 @@ static u64 last_user, last_idle, last_system;
 
 /* USB device state */
 struct zasoby_usb {
-    struct usb_device *udev;
-    __u8               bulk_out_ep;
-    __u8               bulk_in_ep;
-    struct mutex       lock;
+    struct usb_device       *udev;
+    struct usb_interface    *interface;
+    __u8                     bulk_out_ep;
+    __u8                     bulk_in_ep;
+    struct urb              *urb_out;
+    struct urb              *urb_in;
+    unsigned char           *buf_out;
+    unsigned char           *buf_in;
+    size_t                   buf_in_size;
+    struct mutex             lock;
 };
 static struct zasoby_usb *g_zasoby_dev;
 
@@ -83,6 +90,7 @@ static void zasoby_callback(struct timer_list *t);
 static int zasoby_probe(struct usb_interface *intf,
                         const struct usb_device_id *id);
 static void zasoby_disconnect(struct usb_interface *intf);
+static void urb_in_complete(struct urb *urb);
 
 /* USB id table and driver */
 static const struct usb_device_id zasoby_id_table[] = {
@@ -98,7 +106,20 @@ static struct usb_driver zasoby_usb_driver = {
     .id_table   = zasoby_id_table,
 };
 
-/* workqueue handler: CPU/RAM + USB BULK OUT/IN */
+/* URB IN completion: print response */
+static void urb_in_complete(struct urb *urb)
+{
+    struct zasoby_usb *dev = urb->context;
+    if (urb->status == 0) {
+        dev->buf_in[urb->actual_length] = '\0';
+        pr_info(LOG_TAG ": reply: %s\n", dev->buf_in);
+    } else {
+        dev_err(&dev->interface->dev,
+                "bulk-in error %d\n", urb->status);
+    }
+}
+
+/* workqueue handler: CPU/RAM + USB via URBs */
 static void zasoby_work_fn(struct work_struct *work)
 {
     struct sysinfo info;
@@ -106,8 +127,12 @@ static void zasoby_work_fn(struct work_struct *work)
     u64 du, di, ds, dt;
     unsigned int pu = 0, ps = 0, pi = 0;
     int cpu;
-    char msg[128];
-    int len, actual, ret;
+    size_t len;
+    const char *cmd1 = "CPU:30;RAM:20;DISK:10";
+    const char *cmd2 = "CPU:40;RAM:50;DISK:30";
+    const char *to_send;
+    struct zasoby_usb *dev = g_zasoby_dev;
+    int ret;
 
     /* CPU usage calc */
     for_each_online_cpu(cpu) {
@@ -130,51 +155,48 @@ static void zasoby_work_fn(struct work_struct *work)
     /* Memory info */
     si_meminfo(&info);
 
-    /* prepare message (toggle) */
-    {
-        static bool second = false;
-        const char *cmd1 = "CPU:30;RAM:20;DISK:10";
-        const char *cmd2 = "CPU:40;RAM:50;DISK:30";
-        const char *to_send = second ? cmd2 : cmd1;
-        second = !second;
-        len = strlen(to_send);
-        memcpy(msg, to_send, len);
-    }
+    /* toggle message */
+    static bool second = false;
+    to_send = second ? cmd2 : cmd1;
+    second = !second;
+    len = strlen(to_send);
 
-    /* send via USB bulk out/in */
-    if (g_zasoby_dev) {
-        mutex_lock(&g_zasoby_dev->lock);
-        ret = usb_bulk_msg(g_zasoby_dev->udev,
-                           usb_sndbulkpipe(g_zasoby_dev->udev,
-                                           g_zasoby_dev->bulk_out_ep),
-                           msg, len, &actual, 1000);
-        if (ret)
-            dev_err(&g_zasoby_dev->udev->dev,
-                    "bulk-out error %d\n", ret);
+    /* fill out URB buffer */
+    mutex_lock(&dev->lock);
+    memcpy(dev->buf_out, to_send, len);
+    usb_fill_bulk_urb(dev->urb_out,
+                      dev->udev,
+                      usb_sndbulkpipe(dev->udev, dev->bulk_out_ep),
+                      dev->buf_out,
+                      len,
+                      NULL, /* no completion for OUT */
+                      dev);
+    ret = usb_submit_urb(dev->urb_out, GFP_KERNEL);
+    if (ret)
+        dev_err(&dev->interface->dev,
+                "bulk-out submit error %d\n", ret);
 
-        {
-            char resp[128];
-            int rlen;
-            ret = usb_bulk_msg(g_zasoby_dev->udev,
-                               usb_rcvbulkpipe(g_zasoby_dev->udev,
-                                               g_zasoby_dev->bulk_in_ep),
-                               resp, sizeof(resp)-1, &rlen, 1000);
-            if (!ret) {
-                resp[rlen] = '\0';
-                pr_info(LOG_TAG ": reply: %s\n", resp);
-            } else {
-                dev_err(&g_zasoby_dev->udev->dev,
-                        "bulk-in error %d\n", ret);
-            }
-        }
-        mutex_unlock(&g_zasoby_dev->lock);
-    }
+    /* schedule IN URB */
+    usb_fill_bulk_urb(dev->urb_in,
+                      dev->udev,
+                      usb_rcvbulkpipe(dev->udev, dev->bulk_in_ep),
+                      dev->buf_in,
+                      dev->buf_in_size - 1,
+                      urb_in_complete,
+                      dev);
+    ret = usb_submit_urb(dev->urb_in, GFP_KERNEL);
+    if (ret)
+        dev_err(&dev->interface->dev,
+                "bulk-in submit error %d\n", ret);
+    mutex_unlock(&dev->lock);
+
+    /* re-arm timer */
+    mod_timer(&zasoby_timer, jiffies + HZ * INTERVAL_SECONDS);
 }
 
-/* timer callback: re-arm and queue work */
+/* timer callback: queue work */
 static void zasoby_callback(struct timer_list *t)
 {
-    mod_timer(&zasoby_timer, jiffies + HZ * INTERVAL_SECONDS);
     queue_work(zasoby_wq, &zasoby_work);
 }
 
@@ -185,87 +207,101 @@ static int zasoby_probe(struct usb_interface *intf,
     struct usb_host_interface *alt = intf->cur_altsetting;
     struct usb_endpoint_descriptor *ep;
     int i;
+    struct zasoby_usb *dev;
 
-    if (g_zasoby_dev)
-        return -EBUSY;
-
-    g_zasoby_dev = kzalloc(sizeof(*g_zasoby_dev), GFP_KERNEL);
-    if (!g_zasoby_dev)
+    dev = kzalloc(sizeof(*dev), GFP_KERNEL);
+    if (!dev)
         return -ENOMEM;
-
-    mutex_init(&g_zasoby_dev->lock);
-    g_zasoby_dev->udev = usb_get_dev(interface_to_usbdev(intf));
+    dev->interface = intf;
+    dev->udev = usb_get_dev(interface_to_usbdev(intf));
+    mutex_init(&dev->lock);
 
     /* find bulk endpoints */
     for (i = 0; i < alt->desc.bNumEndpoints; ++i) {
         ep = &alt->endpoint[i].desc;
         if (usb_endpoint_is_bulk_out(ep))
-            g_zasoby_dev->bulk_out_ep = ep->bEndpointAddress;
+            dev->bulk_out_ep = ep->bEndpointAddress;
         else if (usb_endpoint_is_bulk_in(ep))
-            g_zasoby_dev->bulk_in_ep = ep->bEndpointAddress;
+            dev->bulk_in_ep = ep->bEndpointAddress;
     }
-    if (!g_zasoby_dev->bulk_out_ep || !g_zasoby_dev->bulk_in_ep) {
+    if (!dev->bulk_out_ep || !dev->bulk_in_ep) {
         dev_err(&intf->dev, "brak BULK OUT/IN\n");
-        goto error_probe;
+        kfree(dev);
+        return -ENODEV;
     }
 
-    /* create workqueue and init work */
-    zasoby_wq = create_singlethread_workqueue("zasoby_wq");
-    if (!zasoby_wq) {
-        dev_err(&intf->dev, "failed to create workqueue\n");
-        goto error_probe;
+    /* allocate URBs and buffers */
+    dev->urb_out = usb_alloc_urb(0, GFP_KERNEL);
+    dev->urb_in  = usb_alloc_urb(0, GFP_KERNEL);
+    dev->buf_out = kmalloc(128, GFP_KERNEL);
+    dev->buf_in_size = BULK_IN_SIZE;
+    dev->buf_in = kmalloc(dev->buf_in_size, GFP_KERNEL);
+    if (!dev->urb_out || !dev->urb_in || !dev->buf_out || !dev->buf_in) {
+        dev_err(&intf->dev, "failed alloc urb/bufs\n");
+        goto error_alloc;
     }
+
+    usb_set_intfdata(intf, dev);
+    g_zasoby_dev = dev;
+
+    /* create workqueue and INIT_WORK */
+    zasoby_wq = create_singlethread_workqueue("zasoby_wq");
+    if (!zasoby_wq)
+        goto error_alloc;
     INIT_WORK(&zasoby_work, zasoby_work_fn);
 
     /* setup timer */
     timer_setup(&zasoby_timer, zasoby_callback, 0);
     mod_timer(&zasoby_timer, jiffies + HZ * INTERVAL_SECONDS);
 
-    dev_info(&intf->dev, "zasoby_usb: device connected\n");
+    dev_info(&intf->dev, "zasoby_usb: connected\n");
     return 0;
 
-error_probe:
-    if (g_zasoby_dev->udev)
-        usb_put_dev(g_zasoby_dev->udev);
-    kfree(g_zasoby_dev);
-    g_zasoby_dev = NULL;
-    return -ENODEV;
+error_alloc:
+    if (dev->urb_out) usb_free_urb(dev->urb_out);
+    if (dev->urb_in) usb_free_urb(dev->urb_in);
+    kfree(dev->buf_out);
+    kfree(dev->buf_in);
+    usb_put_dev(dev->udev);
+    kfree(dev);
+    return -ENOMEM;
 }
 
 /* USB disconnect */
 static void zasoby_disconnect(struct usb_interface *intf)
 {
-    if (!g_zasoby_dev)
-        return;
+    struct zasoby_usb *dev = usb_get_intfdata(intf);
 
     del_timer_sync(&zasoby_timer);
-    flush_workqueue(zasoby_wq);
+    cancel_work_sync(&zasoby_work);
     destroy_workqueue(zasoby_wq);
-    usb_put_dev(g_zasoby_dev->udev);
-    kfree(g_zasoby_dev);
-    g_zasoby_dev = NULL;
-    dev_info(&intf->dev, "zasoby_usb: device disconnected\n");
+
+    usb_kill_urb(dev->urb_out);
+    usb_kill_urb(dev->urb_in);
+    usb_free_urb(dev->urb_out);
+    usb_free_urb(dev->urb_in);
+    kfree(dev->buf_out);
+    kfree(dev->buf_in);
+
+    usb_put_dev(dev->udev);
+    kfree(dev);
+    pr_info(LOG_TAG ": disconnected\n");
 }
 
 /* module init/exit */
 static int __init zasoby_init(void)
 {
     int ret;
-
     proc_entry = proc_create(PROCFS_NAME, 0666, NULL, &proc_file_ops);
-    if (!proc_entry) {
-        pr_err("failed to create /proc/%s\n", PROCFS_NAME);
+    if (!proc_entry)
         return -ENOMEM;
-    }
 
     ret = usb_register(&zasoby_usb_driver);
     if (ret) {
-        pr_err("usb_register failed: %d\n", ret);
         proc_remove(proc_entry);
         return ret;
     }
-
-    pr_info(LOG_TAG ": module loaded (default MiB)\n");
+    pr_info(LOG_TAG ": module loaded\n");
     return 0;
 }
 
@@ -282,4 +318,4 @@ module_exit(zasoby_exit);
 MODULE_LICENSE("GPL");
 MODULE_AUTHOR("student_debil");
 MODULE_DESCRIPTION(
-    "Moduł CPU/RAM co 1s + USB BULK OUT/IN + procfs MiB/GiB sel; workqueue zamiast timer callback");
+    "Moduł CPU/RAM co 1s + USB BULK OUT/IN asynchronicznie przez URB + procfs");
